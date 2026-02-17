@@ -1,73 +1,49 @@
 /**
- * FatSecret Barcode Lookup - Fixed OAuth signature
+ * FatSecret Barcode Lookup - Using oauth-1.0a library
  */
 
+const OAuth = require('oauth-1.0a');
 const crypto = require('crypto');
 
-const API_URL = 'https://platform.fatsecret.com/rest/server.api';
 const KEY = process.env.FATSECRET_CONSUMER_KEY || '87accb3608ca43c595b2868e06a26080';
 const SECRET = process.env.FATSECRET_CONSUMER_SECRET || 'fdd9a0e31d1d49599d5300d49b7bdd22';
 
-function makeSignature(method, url, params, secret) {
-    // Sort params alphabetically
-    const sorted = Object.keys(params).sort().map(k => {
-        return encodeURIComponent(k) + '=' + encodeURIComponent(params[k]);
-    }).join('&');
+const oauth = OAuth({
+    consumer: { key: KEY, secret: SECRET },
+    signature_method: 'HMAC-SHA1',
+    hash_function(base_string, key) {
+        return crypto.createHmac('sha1', key).update(base_string).digest('base64');
+    }
+});
 
-    // Build signature base string
-    const base = method + '&' + encodeURIComponent(url) + '&' + encodeURIComponent(sorted);
+async function callFatSecret(method, params = {}) {
+    const url = 'https://platform.fatsecret.com/rest/server.api';
     
-    // HMAC-SHA1 with secret& (note the ampersand)
-    const key = encodeURIComponent(secret) + '&';
-    const hmac = crypto.createHmac('sha1', key);
-    hmac.update(base);
-    
-    return hmac.digest('base64');
-}
-
-async function callFatSecret(methodName, extraParams = {}) {
-    const params = {
-        method: methodName,
-        format: 'json',
-        oauth_consumer_key: KEY,
-        oauth_nonce: Math.random().toString(36).substr(2),
-        oauth_signature_method: 'HMAC-SHA1',
-        oauth_timestamp: Math.floor(Date.now() / 1000).toString(),
-        oauth_version: '1.0',
-        ...extraParams
+    const requestData = {
+        url: url,
+        method: 'POST',
+        data: { method, format: 'json', ...params }
     };
 
-    // Generate signature
-    const signature = makeSignature('POST', API_URL, params, SECRET);
-    params.oauth_signature = signature;
+    const authHeader = oauth.toHeader(oauth.authorize(requestData));
+    
+    const body = new URLSearchParams(requestData.data).toString();
 
-    // Build request body
-    const body = Object.keys(params).map(k => 
-        encodeURIComponent(k) + '=' + encodeURIComponent(params[k])
-    ).join('&');
+    console.log('Calling FatSecret:', method);
 
-    console.log('Calling:', methodName);
-
-    const response = await fetch(API_URL, {
+    const response = await fetch(url, {
         method: 'POST',
         headers: {
+            ...authHeader,
             'Content-Type': 'application/x-www-form-urlencoded'
         },
         body: body
     });
 
     const text = await response.text();
-    
-    try {
-        const json = JSON.parse(text);
-        if (json.error) {
-            console.error('FatSecret error:', json.error);
-        }
-        return json;
-    } catch (e) {
-        console.error('Parse error:', text);
-        throw new Error('Bad response: ' + text.substring(0, 100));
-    }
+    console.log('Response:', text.substring(0, 300));
+
+    return JSON.parse(text);
 }
 
 export default async function handler(req, res) {
@@ -78,35 +54,28 @@ export default async function handler(req, res) {
     if (!code) return res.status(400).json({ error: 'Missing ?code=' });
 
     try {
-        console.log('Barcode lookup:', code);
+        console.log('Looking up barcode:', code);
         
-        // Step 1: barcode → food_id
         const lookup = await callFatSecret('food.find_id_for_barcode', { barcode: code });
         
+        if (lookup.error) {
+            return res.status(404).json({ error: 'Not found', barcode: code, details: lookup });
+        }
+
         const foodId = lookup?.food_id?.value || lookup?.food_id;
-        
-        if (!foodId || lookup.error) {
-            return res.status(404).json({
-                error: 'Not found',
-                barcode: code,
-                details: lookup
-            });
+        if (!foodId) {
+            return res.status(404).json({ error: 'No food_id', barcode: code, raw: lookup });
         }
 
         console.log('Found food_id:', foodId);
 
-        // Step 2: food_id → full data
         const food = await callFatSecret('food.get.v4', { food_id: foodId.toString() });
 
         if (food.error) {
-            return res.status(500).json({ error: 'Food fetch failed', details: food });
+            return res.status(500).json({ error: 'Failed to fetch food', details: food });
         }
 
-        return res.json({
-            success: true,
-            barcode: code,
-            data: food
-        });
+        return res.json({ success: true, barcode: code, data: food });
 
     } catch (err) {
         console.error('Error:', err);
