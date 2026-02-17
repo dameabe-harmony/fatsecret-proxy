@@ -13,11 +13,11 @@ const API_URL = "https://platform.fatsecret.com/rest/server.api";
 /** ---------------------------
  *  Config you can change
  *  --------------------------- */
-const CACHE_S_MAXAGE_SECONDS = 60 * 60 * 24; // 24 hours
-const CACHE_STALE_WHILE_REVALIDATE_SECONDS = 60 * 60 * 24 * 7; // 7 days
+const CACHE_S_MAXAGE_SECONDS = 60 * 60 * 24 * 7; // 168 hours = 7 days
+const CACHE_STALE_WHILE_REVALIDATE_SECONDS = 60 * 60 * 24 * 14; // optional: 14 days
 
 const RATE_LIMIT_WINDOW_MS = 60 * 1000; // 1 minute
-const RATE_LIMIT_MAX_REQUESTS = 30; // per window, per IP
+cconst RATE_LIMIT_MAX_REQUESTS = 300; // per minute, per IP
 
 /** ---------------------------
  *  Simple in-memory rate limiter (best-effort)
