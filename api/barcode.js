@@ -1,134 +1,183 @@
-import crypto from 'crypto';
-import fetch from 'node-fetch'; // remove if using Node 18+ with global fetch
-
-const KEY = process.env.FATSECRET_KEY;
-const SECRET = process.env.FATSECRET_SECRET;
-const API_URL = 'https://platform.fatsecret.com/rest/server.api';
-
 /**
- * RFC 3986 OAuth encoding (CRITICAL)
+ * Vercel Serverless Function: /api/barcode
+ * Usage:
+ *   https://YOUR-DOMAIN.vercel.app/api/barcode?code=0123456789012
+ *
+ * Required Environment Variables in Vercel:
+ *   FATSECRET_KEY
+ *   FATSECRET_SECRET
  */
+
+const crypto = require("crypto");
+
+const API_URL = "https://platform.fatsecret.com/rest/server.api";
+
 function oauthEncode(str) {
-    return encodeURIComponent(str)
-        .replace(/[!*'()]/g, c =>
-            '%' + c.charCodeAt(0).toString(16).toUpperCase()
-        );
+  return encodeURIComponent(String(str))
+    .replace(/[!*'()]/g, (c) => "%" + c.charCodeAt(0).toString(16).toUpperCase());
 }
 
-/**
- * Build normalized parameter string
- */
 function buildParameterString(params) {
-    const encoded = Object.entries(params)
-        .map(([k, v]) => [oauthEncode(k), oauthEncode(v)])
-        .sort((a, b) => {
-            if (a[0] === b[0]) return a[1].localeCompare(b[1]);
-            return a[0].localeCompare(b[0]);
-        });
+  const encoded = Object.entries(params)
+    .map(([k, v]) => [oauthEncode(k), oauthEncode(v)])
+    .sort((a, b) => {
+      if (a[0] === b[0]) return a[1].localeCompare(b[1]);
+      return a[0].localeCompare(b[0]);
+    });
 
-    return encoded.map(([k, v]) => `${k}=${v}`).join('&');
+  return encoded.map(([k, v]) => `${k}=${v}`).join("&");
 }
 
-/**
- * Build OAuth signature
- */
-function buildSignature(method, url, paramString) {
-    const baseString =
-        `${method.toUpperCase()}&${oauthEncode(url)}&${oauthEncode(paramString)}`;
+function buildSignature(httpMethod, url, paramString, secret) {
+  const baseString =
+    `${httpMethod.toUpperCase()}&${oauthEncode(url)}&${oauthEncode(paramString)}`;
 
-    const signingKey = `${oauthEncode(SECRET)}&`;
+  const signingKey = `${oauthEncode(secret)}&`;
 
-    return crypto
-        .createHmac('sha1', signingKey)
-        .update(baseString)
-        .digest('base64');
+  return crypto
+    .createHmac("sha1", signingKey)
+    .update(baseString)
+    .digest("base64");
 }
 
-/**
- * Generic FatSecret API caller
- */
 async function callFatSecret(methodName, extraParams = {}) {
-    const oauthParams = {
-        oauth_consumer_key: KEY,
-        oauth_nonce: crypto.randomBytes(16).toString('hex'),
-        oauth_signature_method: 'HMAC-SHA1',
-        oauth_timestamp: Math.floor(Date.now() / 1000).toString(),
-        oauth_version: '1.0'
-    };
+  const KEY = process.env.FATSECRET_KEY;
+  const SECRET = process.env.FATSECRET_SECRET;
 
-    const allParams = {
-        method: methodName,
-        format: 'json',
-        ...extraParams,
-        ...oauthParams
-    };
+  if (!KEY || !SECRET) {
+    throw new Error("Missing FATSECRET_KEY or FATSECRET_SECRET in Vercel Environment Variables");
+  }
 
-    const paramString = buildParameterString(allParams);
-    const signature = buildSignature('GET', API_URL, paramString);
+  const oauthParams = {
+    oauth_consumer_key: KEY,
+    oauth_nonce: crypto.randomBytes(16).toString("hex"),
+    oauth_signature_method: "HMAC-SHA1",
+    oauth_timestamp: Math.floor(Date.now() / 1000).toString(),
+    oauth_version: "1.0",
+  };
 
-    const finalUrl =
-        `${API_URL}?${paramString}&oauth_signature=${oauthEncode(signature)}`;
+  const allParams = {
+    method: methodName,
+    format: "json",
+    ...extraParams,
+    ...oauthParams,
+  };
 
-    const response = await fetch(finalUrl, { method: 'GET' });
-    const text = await response.text();
+  const paramString = buildParameterString(allParams);
+  const signature = buildSignature("GET", API_URL, paramString, SECRET);
 
-    if (!response.ok) {
-        throw new Error(`FatSecret error: ${text}`);
-    }
+  const finalUrl =
+    `${API_URL}?${paramString}&oauth_signature=${oauthEncode(signature)}`;
 
-    return JSON.parse(text);
+  const response = await fetch(finalUrl, { method: "GET" });
+  const text = await response.text();
+
+  // FatSecret often returns JSON even on errors; but sometimes it returns plain text.
+  let json;
+  try {
+    json = JSON.parse(text);
+  } catch (e) {
+    throw new Error(`FatSecret returned non-JSON (${response.status}): ${text.slice(0, 300)}`);
+  }
+
+  return json;
 }
 
-/**
- * Next.js API Route Handler
- */
-export default async function handler(req, res) {
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+module.exports = async (req, res) => {
+  // Basic CORS (optional)
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 
-    if (req.method === 'OPTIONS') return res.status(200).end();
-    if (req.method !== 'GET')
-        return res.status(405).json({ error: 'GET only' });
+  if (req.method === "OPTIONS") {
+    res.statusCode = 200;
+    return res.end();
+  }
 
-    const { code } = req.query;
-    if (!code)
-        return res.status(400).json({ error: 'Missing ?code=' });
+  if (req.method !== "GET") {
+    res.statusCode = 405;
+    res.setHeader("Content-Type", "application/json");
+    return res.end(JSON.stringify({ error: "GET only" }));
+  }
 
-    try {
-        // STEP 1 — Find food_id by barcode
-        const barcodeResult = await callFatSecret(
-            'food.find_id_for_barcode',
-            { barcode: code }
-        );
+  const code = req.query && req.query.code;
 
-        if (!barcodeResult?.food_id) {
-            return res.status(404).json({
-                error: 'Barcode not found',
-                barcode: code,
-                raw: barcodeResult
-            });
-        }
+  if (!code) {
+    res.statusCode = 400;
+    res.setHeader("Content-Type", "application/json");
+    return res.end(JSON.stringify({ error: "Missing ?code=" }));
+  }
 
-        const foodId =
-            barcodeResult.food_id.value || barcodeResult.food_id;
+  try {
+    // Step 1: find food_id for barcode
+    const barcodeResult = await callFatSecret("food.find_id_for_barcode", {
+      barcode: code,
+    });
 
-        // STEP 2 — Fetch full food details
-        const foodResult = await callFatSecret(
-            'food.get.v4',
-            { food_id: foodId.toString() }
-        );
-
-        return res.json({
-            success: true,
-            barcode: code,
-            food_name: foodResult?.food?.food_name,
-            data: foodResult
-        });
-
-    } catch (err) {
-        return res.status(500).json({
-            error: 'Server error',
-            message: err.message
-        });
+    if (barcodeResult && barcodeResult.error) {
+      res.statusCode = 404;
+      res.setHeader("Content-Type", "application/json");
+      return res.end(
+        JSON.stringify({
+          error: "Barcode not found",
+          barcode: code,
+          details: barcodeResult.error,
+        })
+      );
     }
-}
+
+    const foodId =
+      (barcodeResult && barcodeResult.food_id && barcodeResult.food_id.value) ||
+      (barcodeResult && barcodeResult.food_id);
+
+    if (!foodId) {
+      res.statusCode = 404;
+      res.setHeader("Content-Type", "application/json");
+      return res.end(
+        JSON.stringify({
+          error: "No food_id returned",
+          barcode: code,
+          raw: barcodeResult,
+        })
+      );
+    }
+
+    // Step 2: fetch full food record
+    const foodResult = await callFatSecret("food.get.v4", {
+      food_id: String(foodId),
+    });
+
+    if (foodResult && foodResult.error) {
+      res.statusCode = 500;
+      res.setHeader("Content-Type", "application/json");
+      return res.end(
+        JSON.stringify({
+          error: "Food fetch failed",
+          details: foodResult.error,
+        })
+      );
+    }
+
+    res.statusCode = 200;
+    res.setHeader("Content-Type", "application/json");
+    return res.end(
+      JSON.stringify({
+        success: true,
+        barcode: code,
+        food_name: foodResult && foodResult.food && foodResult.food.food_name,
+        data: foodResult,
+      })
+    );
+  } catch (err) {
+    console.error("Server Error:", err);
+
+    res.statusCode = 500;
+    res.setHeader("Content-Type", "application/json");
+    return res.end(
+      JSON.stringify({
+        error: "Server error",
+        message: err && err.message ? err.message : String(err),
+      })
+    );
+  }
+};
