@@ -1,0 +1,16 @@
+{
+  "name": "fatsecret-proxy",
+  "version": "1.0.0",
+  "description": "Serverless proxy for FatSecret API to avoid CORS issues",
+  "main": "api/barcode.js",
+  "scripts": {
+    "dev": "vercel dev",
+    "deploy": "vercel --prod"
+  },
+  "dependencies": {
+    "crypto": "^1.0.1"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
