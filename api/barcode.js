@@ -1,127 +1,131 @@
-/**
- * FatSecret Barcode Lookup - Using EXACT working pattern from Nathan M (Google Groups)
- * Source: https://groups.google.com/g/fatsecret-platform-api/c/1dYqsEaZPqE
- */
+import crypto from 'crypto';
+import fetch from 'node-fetch'; // remove if using Node 18+ with global fetch
 
-const crypto = require('crypto');
-
-const KEY = '87accb3608ca43c595b2868e06a26080';
-const SECRET = 'fdd9a0e31d1d49599d5300d49b7bdd22';
+const KEY = process.env.FATSECRET_KEY;
+const SECRET = process.env.FATSECRET_SECRET;
 const API_URL = 'https://platform.fatsecret.com/rest/server.api';
 
-function buildRequestParameterString(inputParameters) {
-    let params = '';
-    Object.entries(inputParameters)
-        .sort()
-        .forEach((cur) => (params += `&${encodeURI(cur[0])}=${encodeURI(cur[1])}`));
-    params = params.substring(1); // Remove leading &
-    return params;
+/**
+ * RFC 3986 OAuth encoding (CRITICAL)
+ */
+function oauthEncode(str) {
+    return encodeURIComponent(str)
+        .replace(/[!*'()]/g, c =>
+            '%' + c.charCodeAt(0).toString(16).toUpperCase()
+        );
 }
 
-function buildSignature(httpMethod, url, paramString) {
-    const method = encodeURIComponent(httpMethod);
-    const encodedUrl = encodeURIComponent(url);
-    const params = encodeURIComponent(paramString);
-    
-    // CRITICAL: Note the & after SECRET
-    const signature = crypto
-        .createHmac('sha1', `${SECRET}&`)
-        .update(`${method}&${encodedUrl}&${params}`)
-        .digest()
-        .toString('base64');
-    
-    return encodeURIComponent(signature);
+/**
+ * Build normalized parameter string
+ */
+function buildParameterString(params) {
+    const encoded = Object.entries(params)
+        .map(([k, v]) => [oauthEncode(k), oauthEncode(v)])
+        .sort((a, b) => {
+            if (a[0] === b[0]) return a[1].localeCompare(b[1]);
+            return a[0].localeCompare(b[0]);
+        });
+
+    return encoded.map(([k, v]) => `${k}=${v}`).join('&');
 }
 
+/**
+ * Build OAuth signature
+ */
+function buildSignature(method, url, paramString) {
+    const baseString =
+        `${method.toUpperCase()}&${oauthEncode(url)}&${oauthEncode(paramString)}`;
+
+    const signingKey = `${oauthEncode(SECRET)}&`;
+
+    return crypto
+        .createHmac('sha1', signingKey)
+        .update(baseString)
+        .digest('base64');
+}
+
+/**
+ * Generic FatSecret API caller
+ */
 async function callFatSecret(methodName, extraParams = {}) {
-    const inputParameters = {
-        ...extraParams,
-        method: methodName,
-        format: 'json',
+    const oauthParams = {
         oauth_consumer_key: KEY,
-        oauth_nonce: Math.random().toString(36).substring(2, 15),
+        oauth_nonce: crypto.randomBytes(16).toString('hex'),
         oauth_signature_method: 'HMAC-SHA1',
         oauth_timestamp: Math.floor(Date.now() / 1000).toString(),
         oauth_version: '1.0'
     };
-    
-    const paramString = buildRequestParameterString(inputParameters);
-    const signature = buildSignature('POST', API_URL, paramString);
-    
-    console.log('Calling FatSecret:', methodName);
-    
-    const response = await fetch(`${API_URL}?${paramString}&oauth_signature=${signature}`, {
-        method: 'POST'
-    });
-    
+
+    const allParams = {
+        method: methodName,
+        format: 'json',
+        ...extraParams,
+        ...oauthParams
+    };
+
+    const paramString = buildParameterString(allParams);
+    const signature = buildSignature('GET', API_URL, paramString);
+
+    const finalUrl =
+        `${API_URL}?${paramString}&oauth_signature=${oauthEncode(signature)}`;
+
+    const response = await fetch(finalUrl, { method: 'GET' });
     const text = await response.text();
-    console.log('Status:', response.status);
-    console.log('Response:', text.substring(0, 500));
-    
-    try {
-        return JSON.parse(text);
-    } catch (e) {
-        throw new Error('Invalid JSON: ' + text);
+
+    if (!response.ok) {
+        throw new Error(`FatSecret error: ${text}`);
     }
+
+    return JSON.parse(text);
 }
 
+/**
+ * Next.js API Route Handler
+ */
 export default async function handler(req, res) {
-    // CORS
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
-    
+
     if (req.method === 'OPTIONS') return res.status(200).end();
-    if (req.method !== 'GET') return res.status(405).json({ error: 'GET only' });
-    
+    if (req.method !== 'GET')
+        return res.status(405).json({ error: 'GET only' });
+
     const { code } = req.query;
-    if (!code) return res.status(400).json({ error: 'Missing ?code=' });
-    
+    if (!code)
+        return res.status(400).json({ error: 'Missing ?code=' });
+
     try {
-        console.log('=== Barcode:', code);
-        
-        // Step 1: Get food_id
-        const barcodeResult = await callFatSecret('food.find_id_for_barcode', { barcode: code });
-        
-        if (barcodeResult.error) {
+        // STEP 1 — Find food_id by barcode
+        const barcodeResult = await callFatSecret(
+            'food.find_id_for_barcode',
+            { barcode: code }
+        );
+
+        if (!barcodeResult?.food_id) {
             return res.status(404).json({
                 error: 'Barcode not found',
-                barcode: code,
-                details: barcodeResult.error
-            });
-        }
-        
-        const foodId = barcodeResult?.food_id?.value || barcodeResult?.food_id;
-        
-        if (!foodId) {
-            return res.status(404).json({
-                error: 'No food_id',
                 barcode: code,
                 raw: barcodeResult
             });
         }
-        
-        console.log('Food ID:', foodId);
-        
-        // Step 2: Get full data
-        const foodResult = await callFatSecret('food.get.v4', { food_id: foodId.toString() });
-        
-        if (foodResult.error) {
-            return res.status(500).json({
-                error: 'Food fetch failed',
-                details: foodResult.error
-            });
-        }
-        
-        console.log('Success:', foodResult?.food?.food_name);
-        
+
+        const foodId =
+            barcodeResult.food_id.value || barcodeResult.food_id;
+
+        // STEP 2 — Fetch full food details
+        const foodResult = await callFatSecret(
+            'food.get.v4',
+            { food_id: foodId.toString() }
+        );
+
         return res.json({
             success: true,
             barcode: code,
+            food_name: foodResult?.food?.food_name,
             data: foodResult
         });
-        
+
     } catch (err) {
-        console.error('Error:', err);
         return res.status(500).json({
             error: 'Server error',
             message: err.message
