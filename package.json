@@ -4,5 +4,8 @@
   "description": "Serverless proxy for FatSecret API",
   "engines": {
     "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "stripe": "^14.25.0"
   }
 }
