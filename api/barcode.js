@@ -1,163 +1,268 @@
 /**
- * FatSecret Barcode Lookup - OAuth 1.0a (correct implementation)
+ * /api/barcode?code=XXXXXXXXXXXX
+ *
+ * Env vars (Vercel Project Settings â†’ Environment Variables):
+ *   FATSECRET_CONSUMER_KEY
+ *   FATSECRET_CONSUMER_SECRET
  */
 
-const crypto = require('crypto');
+const crypto = require("crypto");
 
-const CONSUMER_KEY = process.env.FATSECRET_CONSUMER_KEY;
-const CONSUMER_SECRET = process.env.FATSECRET_CONSUMER_SECRET;
-const API_URL = 'https://platform.fatsecret.com/rest/server.api';
+const API_URL = "https://platform.fatsecret.com/rest/server.api";
 
-if (!CONSUMER_KEY || !CONSUMER_SECRET) {
-    throw new Error('CRITICAL: FATSECRET_CONSUMER_KEY and FATSECRET_CONSUMER_SECRET environment variables must be set in Vercel dashboard');
+/** ---------------------------
+ *  Config you can change
+ *  --------------------------- */
+const CACHE_S_MAXAGE_SECONDS = 60 * 60 * 24 * 7; // 168 hours = 7 days
+const CACHE_STALE_WHILE_REVALIDATE_SECONDS = 60 * 60 * 24 * 14; // optional: 14 days
+
+const RATE_LIMIT_WINDOW_MS = 60 * 1000; // 1 minute
+const RATE_LIMIT_MAX_REQUESTS = 300; // per minute, per IP
+
+/** ---------------------------
+ *  Simple in-memory rate limiter (best-effort)
+ *  --------------------------- */
+const rateBuckets = new Map(); // ip -> { count, resetAt }
+
+function getClientIp(req) {
+  // Vercel typically provides x-forwarded-for: "client, proxy1, proxy2"
+  const xff = req.headers["x-forwarded-for"];
+  if (typeof xff === "string" && xff.length > 0) {
+    return xff.split(",")[0].trim();
+  }
+  // Fallbacks (may be empty in some runtimes)
+  return (
+    req.headers["x-real-ip"] ||
+    req.connection?.remoteAddress ||
+    req.socket?.remoteAddress ||
+    "unknown"
+  );
 }
 
-/**
- * RFC 3986 percent-encoding (required by OAuth 1.0a)
- * encodeURIComponent doesn't encode !'()* so we fix those manually
- */
-function percentEncode(str) {
-    return encodeURIComponent(str)
-        .replace(/!/g, '%21')
-        .replace(/'/g, '%27')
-        .replace(/\(/g, '%28')
-        .replace(/\)/g, '%29')
-        .replace(/\*/g, '%2A');
+function checkRateLimit(ip) {
+  const now = Date.now();
+  let bucket = rateBuckets.get(ip);
+
+  if (!bucket || now >= bucket.resetAt) {
+    bucket = { count: 0, resetAt: now + RATE_LIMIT_WINDOW_MS };
+    rateBuckets.set(ip, bucket);
+  }
+
+  bucket.count += 1;
+
+  const remaining = Math.max(0, RATE_LIMIT_MAX_REQUESTS - bucket.count);
+  const resetSeconds = Math.ceil((bucket.resetAt - now) / 1000);
+
+  return {
+    allowed: bucket.count <= RATE_LIMIT_MAX_REQUESTS,
+    remaining,
+    resetSeconds,
+    limit: RATE_LIMIT_MAX_REQUESTS,
+  };
 }
 
-function generateNonce() {
-    return crypto.randomBytes(16).toString('hex');
+// tiny cleanup so Map doesn't grow forever
+function cleanupRateBuckets() {
+  const now = Date.now();
+  for (const [ip, bucket] of rateBuckets.entries()) {
+    if (now >= bucket.resetAt + RATE_LIMIT_WINDOW_MS) {
+      rateBuckets.delete(ip);
+    }
+  }
 }
 
-function buildSignature(method, url, params) {
-    // Sort params alphabetically and encode
-    const paramString = Object.keys(params)
-        .sort()
-        .map(key => `${percentEncode(key)}=${percentEncode(params[key])}`)
-        .join('&');
+/** ---------------------------
+ *  OAuth helpers
+ *  --------------------------- */
+function oauthEncode(str) {
+  return encodeURIComponent(String(str)).replace(
+    /[!*'()]/g,
+    (c) => "%" + c.charCodeAt(0).toString(16).toUpperCase()
+  );
+}
 
-    // Build signature base string
-    const baseString = [
-        method.toUpperCase(),
-        percentEncode(url),
-        percentEncode(paramString)
-    ].join('&');
+function buildParameterString(params) {
+  const encoded = Object.entries(params)
+    .map(([k, v]) => [oauthEncode(k), oauthEncode(v)])
+    .sort((a, b) => {
+      if (a[0] === b[0]) return a[1].localeCompare(b[1]);
+      return a[0].localeCompare(b[0]);
+    });
 
-    // Sign with HMAC-SHA1 (key is consumer_secret&token_secret, token_secret is empty)
-    const signingKey = `${percentEncode(CONSUMER_SECRET)}&`;
+  return encoded.map(([k, v]) => `${k}=${v}`).join("&");
+}
 
-    const signature = crypto
-        .createHmac('sha1', signingKey)
-        .update(baseString)
-        .digest('base64');
+function buildSignature(httpMethod, url, paramString, secret) {
+  const baseString = `${httpMethod.toUpperCase()}&${oauthEncode(url)}&${oauthEncode(paramString)}`;
+  const signingKey = `${oauthEncode(secret)}&`;
 
-    return signature;
+  return crypto.createHmac("sha1", signingKey).update(baseString).digest("base64");
 }
 
 async function callFatSecret(methodName, extraParams = {}) {
-    const params = {
-        ...extraParams,
-        method: methodName,
-        format: 'json',
-        oauth_consumer_key: CONSUMER_KEY,
-        oauth_nonce: generateNonce(),
-        oauth_signature_method: 'HMAC-SHA1',
-        oauth_timestamp: Math.floor(Date.now() / 1000).toString(),
-        oauth_version: '1.0'
-    };
+  const KEY = process.env.FATSECRET_CONSUMER_KEY;
+  const SECRET = process.env.FATSECRET_CONSUMER_SECRET;
 
-    // Generate signature
-    const signature = buildSignature('POST', API_URL, params);
+  if (!KEY || !SECRET) {
+    throw new Error("Missing FATSECRET_CONSUMER_KEY or FATSECRET_CONSUMER_SECRET in Vercel Environment Variables");
+  }
 
-    // Add signature to params
-    params.oauth_signature = signature;
+  const oauthParams = {
+    oauth_consumer_key: KEY,
+    oauth_nonce: crypto.randomBytes(16).toString("hex"),
+    oauth_signature_method: "HMAC-SHA1",
+    oauth_timestamp: Math.floor(Date.now() / 1000).toString(),
+    oauth_version: "1.0",
+  };
 
-    // Build POST body
-    const body = Object.keys(params)
-        .map(key => `${percentEncode(key)}=${percentEncode(params[key])}`)
-        .join('&');
+  const allParams = {
+    method: methodName,
+    format: "json",
+    ...extraParams,
+    ...oauthParams,
+  };
 
-    console.log('Calling FatSecret:', methodName);
+  const paramString = buildParameterString(allParams);
+  const signature = buildSignature("GET", API_URL, paramString, SECRET);
 
-    const response = await fetch(API_URL, {
-        method: 'POST',
-        headers: {
-            'Content-Type': 'application/x-www-form-urlencoded'
-        },
-        body: body
+  const finalUrl = `${API_URL}?${paramString}&oauth_signature=${oauthEncode(signature)}`;
+
+  const response = await fetch(finalUrl, { method: "GET" });
+  const text = await response.text();
+
+  let json;
+  try {
+    json = JSON.parse(text);
+  } catch {
+    throw new Error(`FatSecret returned non-JSON (${response.status}): ${text.slice(0, 300)}`);
+  }
+
+  return json;
+}
+
+/** ---------------------------
+ *  Handler
+ *  --------------------------- */
+module.exports = async (req, res) => {
+  cleanupRateBuckets();
+
+  // CORS (you already set headers in vercel.json too; keeping this is harmless)
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+
+  if (req.method === "OPTIONS") {
+    res.statusCode = 200;
+    return res.end();
+  }
+
+  if (req.method !== "GET") {
+    res.statusCode = 405;
+    res.setHeader("Content-Type", "application/json");
+    return res.end(JSON.stringify({ error: "GET only" }));
+  }
+
+  // Rate limit
+  const ip = getClientIp(req);
+  const rl = checkRateLimit(ip);
+
+  res.setHeader("X-RateLimit-Limit", String(rl.limit));
+  res.setHeader("X-RateLimit-Remaining", String(rl.remaining));
+  res.setHeader("X-RateLimit-Reset", String(rl.resetSeconds));
+
+  if (!rl.allowed) {
+    res.statusCode = 429;
+    res.setHeader("Content-Type", "application/json");
+    return res.end(
+      JSON.stringify({
+        error: "Too many requests",
+        message: `Rate limit exceeded. Try again in ~${rl.resetSeconds}s.`,
+      })
+    );
+  }
+
+  const code = req.query && req.query.code;
+  if (!code) {
+    res.statusCode = 400;
+    res.setHeader("Content-Type", "application/json");
+    return res.end(JSON.stringify({ error: "Missing ?code=" }));
+  }
+
+  try {
+    // CDN caching (per URL, so per barcode)
+    res.setHeader(
+      "Cache-Control",
+      `public, s-maxage=${CACHE_S_MAXAGE_SECONDS}, stale-while-revalidate=${CACHE_STALE_WHILE_REVALIDATE_SECONDS}`
+    );
+
+    // Step 1: find food_id for barcode
+    const barcodeResult = await callFatSecret("food.find_id_for_barcode", {
+      barcode: code,
     });
 
-    const text = await response.text();
-    console.log('Status:', response.status);
-    console.log('Response:', text.substring(0, 500));
-
-    try {
-        return JSON.parse(text);
-    } catch (e) {
-        throw new Error('Invalid JSON: ' + text);
+    if (barcodeResult && barcodeResult.error) {
+      res.statusCode = 404;
+      res.setHeader("Content-Type", "application/json");
+      return res.end(
+        JSON.stringify({
+          error: "Barcode not found",
+          barcode: code,
+          details: barcodeResult.error,
+        })
+      );
     }
-}
 
-export default async function handler(req, res) {
-    // CORS
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+    const foodId =
+      (barcodeResult && barcodeResult.food_id && barcodeResult.food_id.value) ||
+      (barcodeResult && barcodeResult.food_id);
 
-    if (req.method === 'OPTIONS') return res.status(200).end();
-    if (req.method !== 'GET') return res.status(405).json({ error: 'GET only' });
-
-    const { code } = req.query;
-    if (!code) return res.status(400).json({ error: 'Missing ?code=' });
-
-    try {
-        console.log('=== Barcode:', code);
-
-        // Step 1: Get food_id from barcode
-        const barcodeResult = await callFatSecret('food.find_id_for_barcode', { barcode: code });
-
-        if (barcodeResult.error) {
-            return res.status(404).json({
-                error: 'Barcode not found',
-                barcode: code,
-                details: barcodeResult.error
-            });
-        }
-
-        const foodId = barcodeResult?.food_id?.value || barcodeResult?.food_id;
-
-        if (!foodId) {
-            return res.status(404).json({
-                error: 'No food_id',
-                barcode: code,
-                raw: barcodeResult
-            });
-        }
-
-        console.log('Food ID:', foodId);
-
-        // Step 2: Get full nutrition data
-        const foodResult = await callFatSecret('food.get.v4', { food_id: foodId.toString() });
-
-        if (foodResult.error) {
-            return res.status(500).json({
-                error: 'Food fetch failed',
-                details: foodResult.error
-            });
-        }
-
-        console.log('Success:', foodResult?.food?.food_name);
-
-        return res.json({
-            success: true,
-            barcode: code,
-            data: foodResult
-        });
-
-    } catch (err) {
-        console.error('Error:', err);
-        return res.status(500).json({
-            error: 'Server error',
-            message: err.message
-        });
+    if (!foodId) {
+      res.statusCode = 404;
+      res.setHeader("Content-Type", "application/json");
+      return res.end(
+        JSON.stringify({
+          error: "No food_id returned",
+          barcode: code,
+          raw: barcodeResult,
+        })
+      );
     }
-}
+
+    // Step 2: fetch full food record
+    const foodResult = await callFatSecret("food.get.v4", {
+      food_id: String(foodId),
+    });
+
+    if (foodResult && foodResult.error) {
+      res.statusCode = 500;
+      res.setHeader("Content-Type", "application/json");
+      return res.end(
+        JSON.stringify({
+          error: "Food fetch failed",
+          details: foodResult.error,
+        })
+      );
+    }
+
+    res.statusCode = 200;
+    res.setHeader("Content-Type", "application/json");
+    return res.end(
+      JSON.stringify({
+        success: true,
+        barcode: code,
+        food_name: foodResult && foodResult.food && foodResult.food.food_name,
+        data: foodResult,
+      })
+    );
+  } catch (err) {
+    console.error("Server Error:", err);
+    res.statusCode = 500;
+    res.setHeader("Content-Type", "application/json");
+    return res.end(
+      JSON.stringify({
+        error: "Server error",
+        message: err && err.message ? err.message : String(err),
+      })
+    );
+  }
+};
