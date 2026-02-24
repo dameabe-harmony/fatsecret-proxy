@@ -1,36 +1,31 @@
 /**
  * /api/barcode?code=XXXXXXXXXXXX
- *
- * Env vars (Vercel Project Settings â†’ Environment Variables):
+ * 
+ * Uses oauth-1.0a npm package for reliable signing
+ * 
+ * Env vars (Vercel Project Settings → Environment Variables):
  *   FATSECRET_CONSUMER_KEY
  *   FATSECRET_CONSUMER_SECRET
  */
 
 const crypto = require("crypto");
+const OAuth = require("oauth-1.0a");
 
 const API_URL = "https://platform.fatsecret.com/rest/server.api";
 
-/** ---------------------------
- *  Config you can change
- *  --------------------------- */
-const CACHE_S_MAXAGE_SECONDS = 60 * 60 * 24 * 7; // 168 hours = 7 days
-const CACHE_STALE_WHILE_REVALIDATE_SECONDS = 60 * 60 * 24 * 14; // optional: 14 days
+const CACHE_S_MAXAGE_SECONDS = 60 * 60 * 24 * 7;
+const CACHE_STALE_WHILE_REVALIDATE_SECONDS = 60 * 60 * 24 * 14;
 
-const RATE_LIMIT_WINDOW_MS = 60 * 1000; // 1 minute
-const RATE_LIMIT_MAX_REQUESTS = 300; // per minute, per IP
+const RATE_LIMIT_WINDOW_MS = 60 * 1000;
+const RATE_LIMIT_MAX_REQUESTS = 300;
 
-/** ---------------------------
- *  Simple in-memory rate limiter (best-effort)
- *  --------------------------- */
-const rateBuckets = new Map(); // ip -> { count, resetAt }
+const rateBuckets = new Map();
 
 function getClientIp(req) {
-  // Vercel typically provides x-forwarded-for: "client, proxy1, proxy2"
   const xff = req.headers["x-forwarded-for"];
   if (typeof xff === "string" && xff.length > 0) {
     return xff.split(",")[0].trim();
   }
-  // Fallbacks (may be empty in some runtimes)
   return (
     req.headers["x-real-ip"] ||
     req.connection?.remoteAddress ||
@@ -42,17 +37,13 @@ function getClientIp(req) {
 function checkRateLimit(ip) {
   const now = Date.now();
   let bucket = rateBuckets.get(ip);
-
   if (!bucket || now >= bucket.resetAt) {
     bucket = { count: 0, resetAt: now + RATE_LIMIT_WINDOW_MS };
     rateBuckets.set(ip, bucket);
   }
-
   bucket.count += 1;
-
   const remaining = Math.max(0, RATE_LIMIT_MAX_REQUESTS - bucket.count);
   const resetSeconds = Math.ceil((bucket.resetAt - now) / 1000);
-
   return {
     allowed: bucket.count <= RATE_LIMIT_MAX_REQUESTS,
     remaining,
@@ -61,7 +52,6 @@ function checkRateLimit(ip) {
   };
 }
 
-// tiny cleanup so Map doesn't grow forever
 function cleanupRateBuckets() {
   const now = Date.now();
   for (const [ip, bucket] of rateBuckets.entries()) {
@@ -71,61 +61,42 @@ function cleanupRateBuckets() {
   }
 }
 
-/** ---------------------------
- *  OAuth helpers
- *  --------------------------- */
-function oauthEncode(str) {
-  return encodeURIComponent(String(str)).replace(
-    /[!*'()]/g,
-    (c) => "%" + c.charCodeAt(0).toString(16).toUpperCase()
-  );
-}
-
-function buildParameterString(params) {
-  const encoded = Object.entries(params)
-    .map(([k, v]) => [oauthEncode(k), oauthEncode(v)])
-    .sort((a, b) => {
-      if (a[0] === b[0]) return a[1].localeCompare(b[1]);
-      return a[0].localeCompare(b[0]);
-    });
-
-  return encoded.map(([k, v]) => `${k}=${v}`).join("&");
-}
-
-function buildSignature(httpMethod, url, paramString, secret) {
-  const baseString = `${httpMethod.toUpperCase()}&${oauthEncode(url)}&${oauthEncode(paramString)}`;
-  const signingKey = `${oauthEncode(secret)}&`;
-
-  return crypto.createHmac("sha1", signingKey).update(baseString).digest("base64");
-}
-
 async function callFatSecret(methodName, extraParams = {}) {
   const KEY = process.env.FATSECRET_CONSUMER_KEY;
   const SECRET = process.env.FATSECRET_CONSUMER_SECRET;
 
   if (!KEY || !SECRET) {
-    throw new Error("Missing FATSECRET_CONSUMER_KEY or FATSECRET_CONSUMER_SECRET in Vercel Environment Variables");
+    throw new Error("Missing FATSECRET_CONSUMER_KEY or FATSECRET_CONSUMER_SECRET");
   }
 
-  const oauthParams = {
-    oauth_consumer_key: KEY,
-    oauth_nonce: crypto.randomBytes(16).toString("hex"),
-    oauth_signature_method: "HMAC-SHA1",
-    oauth_timestamp: Math.floor(Date.now() / 1000).toString(),
-    oauth_version: "1.0",
+  const oauth = OAuth({
+    consumer: { key: KEY, secret: SECRET },
+    signature_method: "HMAC-SHA1",
+    hash_function(baseString, key) {
+      return crypto.createHmac("sha1", key).update(baseString).digest("base64");
+    },
+  });
+
+  const requestData = {
+    url: API_URL,
+    method: "GET",
+    data: {
+      method: methodName,
+      format: "json",
+      ...extraParams,
+    },
   };
 
-  const allParams = {
-    method: methodName,
-    format: "json",
-    ...extraParams,
-    ...oauthParams,
-  };
+  // oauth-1.0a generates the Authorization header or query params
+  const authorized = oauth.authorize(requestData);
 
-  const paramString = buildParameterString(allParams);
-  const signature = buildSignature("GET", API_URL, paramString, SECRET);
+  // Build query string with all params (API params + OAuth params)
+  const allParams = { ...requestData.data, ...authorized };
+  const queryString = Object.keys(allParams)
+    .map((k) => `${encodeURIComponent(k)}=${encodeURIComponent(allParams[k])}`)
+    .join("&");
 
-  const finalUrl = `${API_URL}?${paramString}&oauth_signature=${oauthEncode(signature)}`;
+  const finalUrl = `${API_URL}?${queryString}`;
 
   const response = await fetch(finalUrl, { method: "GET" });
   const text = await response.text();
@@ -140,13 +111,9 @@ async function callFatSecret(methodName, extraParams = {}) {
   return json;
 }
 
-/** ---------------------------
- *  Handler
- *  --------------------------- */
 module.exports = async (req, res) => {
   cleanupRateBuckets();
 
-  // CORS (you already set headers in vercel.json too; keeping this is harmless)
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
@@ -162,7 +129,6 @@ module.exports = async (req, res) => {
     return res.end(JSON.stringify({ error: "GET only" }));
   }
 
-  // Rate limit
   const ip = getClientIp(req);
   const rl = checkRateLimit(ip);
 
@@ -189,13 +155,11 @@ module.exports = async (req, res) => {
   }
 
   try {
-    // CDN caching (per URL, so per barcode)
     res.setHeader(
       "Cache-Control",
       `public, s-maxage=${CACHE_S_MAXAGE_SECONDS}, stale-while-revalidate=${CACHE_STALE_WHILE_REVALIDATE_SECONDS}`
     );
 
-    // Step 1: find food_id for barcode
     const barcodeResult = await callFatSecret("food.find_id_for_barcode", {
       barcode: code,
     });
@@ -228,7 +192,6 @@ module.exports = async (req, res) => {
       );
     }
 
-    // Step 2: fetch full food record
     const foodResult = await callFatSecret("food.get.v4", {
       food_id: String(foodId),
     });
