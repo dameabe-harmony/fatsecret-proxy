@@ -1,15 +1,13 @@
 /**
  * /api/barcode?code=XXXXXXXXXXXX
- * 
- * Uses oauth-1.0a npm package for reliable signing
- * 
+ * /api/barcode?debug=1  (temporary - shows credential diagnostics)
+ *
  * Env vars (Vercel Project Settings → Environment Variables):
  *   FATSECRET_CONSUMER_KEY
  *   FATSECRET_CONSUMER_SECRET
  */
 
 const crypto = require("crypto");
-const OAuth = require("oauth-1.0a");
 
 const API_URL = "https://platform.fatsecret.com/rest/server.api";
 
@@ -61,42 +59,61 @@ function cleanupRateBuckets() {
   }
 }
 
+/** ---------------------------
+ *  OAuth helpers (verified against FatSecret docs)
+ *  --------------------------- */
+function oauthEncode(str) {
+  return encodeURIComponent(String(str)).replace(
+    /[!*'()]/g,
+    (c) => "%" + c.charCodeAt(0).toString(16).toUpperCase()
+  );
+}
+
+function buildParameterString(params) {
+  const encoded = Object.entries(params)
+    .map(([k, v]) => [oauthEncode(k), oauthEncode(v)])
+    .sort((a, b) => {
+      if (a[0] === b[0]) return a[1].localeCompare(b[1]);
+      return a[0].localeCompare(b[0]);
+    });
+
+  return encoded.map(([k, v]) => `${k}=${v}`).join("&");
+}
+
+function buildSignature(httpMethod, url, paramString, secret) {
+  const baseString = `${httpMethod.toUpperCase()}&${oauthEncode(url)}&${oauthEncode(paramString)}`;
+  const signingKey = `${oauthEncode(secret)}&`;
+
+  return crypto.createHmac("sha1", signingKey).update(baseString).digest("base64");
+}
+
 async function callFatSecret(methodName, extraParams = {}) {
   const KEY = process.env.FATSECRET_CONSUMER_KEY;
   const SECRET = process.env.FATSECRET_CONSUMER_SECRET;
 
   if (!KEY || !SECRET) {
-    throw new Error("Missing FATSECRET_CONSUMER_KEY or FATSECRET_CONSUMER_SECRET");
+    throw new Error("Missing FATSECRET_CONSUMER_KEY or FATSECRET_CONSUMER_SECRET in Vercel Environment Variables");
   }
 
-  const oauth = OAuth({
-    consumer: { key: KEY, secret: SECRET },
-    signature_method: "HMAC-SHA1",
-    hash_function(baseString, key) {
-      return crypto.createHmac("sha1", key).update(baseString).digest("base64");
-    },
-  });
-
-  const requestData = {
-    url: API_URL,
-    method: "GET",
-    data: {
-      method: methodName,
-      format: "json",
-      ...extraParams,
-    },
+  const oauthParams = {
+    oauth_consumer_key: KEY,
+    oauth_nonce: crypto.randomBytes(16).toString("hex"),
+    oauth_signature_method: "HMAC-SHA1",
+    oauth_timestamp: Math.floor(Date.now() / 1000).toString(),
+    oauth_version: "1.0",
   };
 
-  // oauth-1.0a generates the Authorization header or query params
-  const authorized = oauth.authorize(requestData);
+  const allParams = {
+    method: methodName,
+    format: "json",
+    ...extraParams,
+    ...oauthParams,
+  };
 
-  // Build query string with all params (API params + OAuth params)
-  const allParams = { ...requestData.data, ...authorized };
-  const queryString = Object.keys(allParams)
-    .map((k) => `${encodeURIComponent(k)}=${encodeURIComponent(allParams[k])}`)
-    .join("&");
+  const paramString = buildParameterString(allParams);
+  const signature = buildSignature("GET", API_URL, paramString, SECRET);
 
-  const finalUrl = `${API_URL}?${queryString}`;
+  const finalUrl = `${API_URL}?${paramString}&oauth_signature=${oauthEncode(signature)}`;
 
   const response = await fetch(finalUrl, { method: "GET" });
   const text = await response.text();
@@ -111,6 +128,9 @@ async function callFatSecret(methodName, extraParams = {}) {
   return json;
 }
 
+/** ---------------------------
+ *  Handler
+ *  --------------------------- */
 module.exports = async (req, res) => {
   cleanupRateBuckets();
 
@@ -127,6 +147,30 @@ module.exports = async (req, res) => {
     res.statusCode = 405;
     res.setHeader("Content-Type", "application/json");
     return res.end(JSON.stringify({ error: "GET only" }));
+  }
+
+  // TEMPORARY DIAGNOSTIC - remove after debugging
+  if (req.query && req.query.debug === "1") {
+    const KEY = process.env.FATSECRET_CONSUMER_KEY || "";
+    const SECRET = process.env.FATSECRET_CONSUMER_SECRET || "";
+    
+    // Show just enough to verify without exposing full credentials
+    res.statusCode = 200;
+    res.setHeader("Content-Type", "application/json");
+    return res.end(JSON.stringify({
+      diagnostic: true,
+      key_length: KEY.length,
+      key_first4: KEY.substring(0, 4),
+      key_last4: KEY.substring(KEY.length - 4),
+      key_has_whitespace: KEY !== KEY.trim(),
+      key_has_newline: KEY.includes("\n") || KEY.includes("\r"),
+      secret_length: SECRET.length,
+      secret_first4: SECRET.substring(0, 4),
+      secret_last4: SECRET.substring(SECRET.length - 4),
+      secret_has_whitespace: SECRET !== SECRET.trim(),
+      secret_has_newline: SECRET.includes("\n") || SECRET.includes("\r"),
+      env_var_names: Object.keys(process.env).filter(k => k.includes("FATSECRET")),
+    }));
   }
 
   const ip = getClientIp(req);
