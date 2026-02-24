@@ -6,6 +6,7 @@
     "node": ">=18.0.0"
   },
   "dependencies": {
+    "oauth-1.0a": "^2.2.6",
     "stripe": "^14.25.0"
   }
 }
