@@ -1,67 +1,95 @@
 /**
- * FatSecret Barcode Lookup - OAuth 2.0
+ * FatSecret Barcode Lookup - OAuth 1.0a (correct implementation)
  */
 
+const crypto = require('crypto');
+
+const CONSUMER_KEY = process.env.FATSECRET_CONSUMER_KEY;
+const CONSUMER_SECRET = process.env.FATSECRET_CONSUMER_SECRET;
 const API_URL = 'https://platform.fatsecret.com/rest/server.api';
-const TOKEN_URL = 'https://oauth.fatsecret.com/connect/token';
 
-const CLIENT_ID = process.env.FATSECRET_CONSUMER_KEY;
-const CLIENT_SECRET = process.env.FATSECRET_CONSUMER_SECRET;
-
-if (!CLIENT_ID || !CLIENT_SECRET) {
+if (!CONSUMER_KEY || !CONSUMER_SECRET) {
     throw new Error('CRITICAL: FATSECRET_CONSUMER_KEY and FATSECRET_CONSUMER_SECRET environment variables must be set in Vercel dashboard');
 }
 
-let cachedToken = null;
-let tokenExpiry = 0;
-
-async function getAccessToken() {
-    // Return cached token if still valid (with 60s buffer)
-    if (cachedToken && Date.now() < tokenExpiry - 60000) {
-        return cachedToken;
-    }
-
-    const credentials = Buffer.from(`${CLIENT_ID}:${CLIENT_SECRET}`).toString('base64');
-
-    const response = await fetch(TOKEN_URL, {
-        method: 'POST',
-        headers: {
-            'Authorization': `Basic ${credentials}`,
-            'Content-Type': 'application/x-www-form-urlencoded'
-        },
-        body: 'grant_type=client_credentials&scope=basic'
-    });
-
-    if (!response.ok) {
-        const text = await response.text();
-        throw new Error(`Token request failed (${response.status}): ${text}`);
-    }
-
-    const data = await response.json();
-    cachedToken = data.access_token;
-    tokenExpiry = Date.now() + (data.expires_in * 1000);
-
-    return cachedToken;
+/**
+ * RFC 3986 percent-encoding (required by OAuth 1.0a)
+ * encodeURIComponent doesn't encode !'()* so we fix those manually
+ */
+function percentEncode(str) {
+    return encodeURIComponent(str)
+        .replace(/!/g, '%21')
+        .replace(/'/g, '%27')
+        .replace(/\(/g, '%28')
+        .replace(/\)/g, '%29')
+        .replace(/\*/g, '%2A');
 }
 
-async function callFatSecret(methodName, params = {}) {
-    const token = await getAccessToken();
+function generateNonce() {
+    return crypto.randomBytes(16).toString('hex');
+}
 
-    const queryParams = new URLSearchParams({
+function buildSignature(method, url, params) {
+    // Sort params alphabetically and encode
+    const paramString = Object.keys(params)
+        .sort()
+        .map(key => `${percentEncode(key)}=${percentEncode(params[key])}`)
+        .join('&');
+
+    // Build signature base string
+    const baseString = [
+        method.toUpperCase(),
+        percentEncode(url),
+        percentEncode(paramString)
+    ].join('&');
+
+    // Sign with HMAC-SHA1 (key is consumer_secret&token_secret, token_secret is empty)
+    const signingKey = `${percentEncode(CONSUMER_SECRET)}&`;
+
+    const signature = crypto
+        .createHmac('sha1', signingKey)
+        .update(baseString)
+        .digest('base64');
+
+    return signature;
+}
+
+async function callFatSecret(methodName, extraParams = {}) {
+    const params = {
+        ...extraParams,
         method: methodName,
         format: 'json',
-        ...params
-    });
+        oauth_consumer_key: CONSUMER_KEY,
+        oauth_nonce: generateNonce(),
+        oauth_signature_method: 'HMAC-SHA1',
+        oauth_timestamp: Math.floor(Date.now() / 1000).toString(),
+        oauth_version: '1.0'
+    };
 
-    const response = await fetch(`${API_URL}?${queryParams.toString()}`, {
-        method: 'GET',
+    // Generate signature
+    const signature = buildSignature('POST', API_URL, params);
+
+    // Add signature to params
+    params.oauth_signature = signature;
+
+    // Build POST body
+    const body = Object.keys(params)
+        .map(key => `${percentEncode(key)}=${percentEncode(params[key])}`)
+        .join('&');
+
+    console.log('Calling FatSecret:', methodName);
+
+    const response = await fetch(API_URL, {
+        method: 'POST',
         headers: {
-            'Authorization': `Bearer ${token}`
-        }
+            'Content-Type': 'application/x-www-form-urlencoded'
+        },
+        body: body
     });
 
     const text = await response.text();
-    console.log('FatSecret', methodName, 'status:', response.status);
+    console.log('Status:', response.status);
+    console.log('Response:', text.substring(0, 500));
 
     try {
         return JSON.parse(text);
