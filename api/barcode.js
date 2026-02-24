@@ -1,6 +1,5 @@
 /**
  * /api/barcode?code=XXXXXXXXXXXX
- * /api/barcode?debug=1  (temporary - shows credential diagnostics)
  *
  * Env vars (Vercel Project Settings → Environment Variables):
  *   FATSECRET_CONSUMER_KEY
@@ -60,7 +59,7 @@ function cleanupRateBuckets() {
 }
 
 /** ---------------------------
- *  OAuth helpers (verified against FatSecret docs)
+ *  OAuth helpers
  *  --------------------------- */
 function oauthEncode(str) {
   return encodeURIComponent(String(str)).replace(
@@ -147,30 +146,6 @@ module.exports = async (req, res) => {
     res.statusCode = 405;
     res.setHeader("Content-Type", "application/json");
     return res.end(JSON.stringify({ error: "GET only" }));
-  }
-
-  // TEMPORARY DIAGNOSTIC - remove after debugging
-  if (req.query && req.query.debug === "1") {
-    const KEY = process.env.FATSECRET_CONSUMER_KEY || "";
-    const SECRET = process.env.FATSECRET_CONSUMER_SECRET || "";
-    
-    // Show just enough to verify without exposing full credentials
-    res.statusCode = 200;
-    res.setHeader("Content-Type", "application/json");
-    return res.end(JSON.stringify({
-      diagnostic: true,
-      key_length: KEY.length,
-      key_first4: KEY.substring(0, 4),
-      key_last4: KEY.substring(KEY.length - 4),
-      key_has_whitespace: KEY !== KEY.trim(),
-      key_has_newline: KEY.includes("\n") || KEY.includes("\r"),
-      secret_length: SECRET.length,
-      secret_first4: SECRET.substring(0, 4),
-      secret_last4: SECRET.substring(SECRET.length - 4),
-      secret_has_whitespace: SECRET !== SECRET.trim(),
-      secret_has_newline: SECRET.includes("\n") || SECRET.includes("\r"),
-      env_var_names: Object.keys(process.env).filter(k => k.includes("FATSECRET")),
-    }));
   }
 
   const ip = getClientIp(req);
