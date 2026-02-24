@@ -19,7 +19,7 @@ function buildRequestParameterString(inputParameters) {
     let params = '';
     Object.entries(inputParameters)
         .sort()
-        .forEach((cur) => (params += `&${encodeURI(cur[0])}=${encodeURI(cur[1])}`));
+        .forEach((cur) => (params += `&${encodeURIComponent(cur[0])}=${encodeURIComponent(cur[1])}`));
     params = params.substring(1); // Remove leading &
     return params;
 }
