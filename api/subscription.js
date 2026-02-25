@@ -15,8 +15,8 @@
  * Env vars (Vercel):
  *   STRIPE_SECRET_KEY
  *   STRIPE_WEBHOOK_SECRET
- *   STRIPE_PRICE_MONTHLY    (price ID for $6.99/mo)
- *   STRIPE_PRICE_ANNUAL     (price ID for $76.89/yr)
+ *   STRIPE_PRICE_MONTHLY    (price ID for $7.99/mo)
+ *   STRIPE_PRICE_ANNUAL     (price ID for $87.89/yr)
  *   SUPABASE_URL
  *   SUPABASE_SERVICE_ROLE_KEY  (NOT the anon key — service role for backend writes)
  *   NEXT_PUBLIC_APP_URL     (e.g., https://your-app.vercel.app)
@@ -121,7 +121,7 @@ module.exports = async (req, res) => {
     // CREATE CHECKOUT SESSION
     // ===========================================================
     if (action === 'create-checkout') {
-      const { userId, email, period } = req.body || {};
+      const { userId, email, period, promoCode } = req.body || {};
 
       if (!userId || !email) {
         return res.status(400).json({ error: 'Missing userId or email' });
@@ -147,8 +147,8 @@ module.exports = async (req, res) => {
         await updateProfile(userId, { stripe_customer_id: customerId });
       }
 
-      // Create checkout session
-      const session = await stripe.checkout.sessions.create({
+      // Build checkout session config
+      const sessionConfig = {
         customer: customerId,
         mode: 'subscription',
         payment_method_types: ['card'],
@@ -170,7 +170,28 @@ module.exports = async (req, res) => {
           supabase_user_id: userId,
           period,
         },
-      });
+      };
+
+      // Add promo code if provided
+      if (promoCode) {
+        sessionConfig.allow_promotion_codes = true;
+        // If it's a specific promo code, try to find it
+        try {
+          const promoCodes = await stripe.promotionCodes.list({ code: promoCode, active: true, limit: 1 });
+          if (promoCodes.data.length > 0) {
+            sessionConfig.discounts = [{ promotion_code: promoCodes.data[0].id }];
+          } else {
+            // Let Stripe handle it — user can enter at checkout
+            sessionConfig.allow_promotion_codes = true;
+          }
+        } catch (promoErr) {
+          console.log('Promo code lookup failed, allowing manual entry:', promoErr.message);
+          sessionConfig.allow_promotion_codes = true;
+        }
+      }
+
+      // Create checkout session
+      const session = await stripe.checkout.sessions.create(sessionConfig);
 
       return res.status(200).json({ url: session.url, sessionId: session.id });
     }
