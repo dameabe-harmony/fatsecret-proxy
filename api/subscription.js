@@ -161,6 +161,7 @@ module.exports = async (req, res) => {
         success_url: `${APP_URL}?subscription=success&session_id={CHECKOUT_SESSION_ID}`,
         cancel_url: `${APP_URL}?subscription=canceled`,
         subscription_data: {
+          trial_period_days: 4,
           metadata: {
             supabase_user_id: userId,
             period,
