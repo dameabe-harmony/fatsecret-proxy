@@ -2,7 +2,7 @@
  * /api/subscription — Stripe Subscription Management
  *
  * POST /api/subscription?action=create-checkout
- *   Body: { userId, email, period: 'monthly'|'annual' }
+ *   Body: { userId, email, period: 'monthly'|'annual', promoCode? }
  *   Returns: { url: 'https://checkout.stripe.com/...' }
  *
  * POST /api/subscription?action=create-portal
@@ -19,21 +19,59 @@
  *   STRIPE_PRICE_ANNUAL     (price ID for $87.89/yr)
  *   SUPABASE_URL
  *   SUPABASE_SERVICE_ROLE_KEY  (NOT the anon key — service role for backend writes)
- *   NEXT_PUBLIC_APP_URL     (e.g., https://your-app.vercel.app)
+ *   NEXT_PUBLIC_APP_URL     (e.g., https://harmoniousfood.harmonytec.net)
  */
 
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const APP_URL = process.env.NEXT_PUBLIC_APP_URL || 'https://findharmoniousfood.com';
+const APP_URL = process.env.NEXT_PUBLIC_APP_URL || 'https://harmoniousfood.harmonytec.net';
 
 const PRICES = {
   monthly: process.env.STRIPE_PRICE_MONTHLY,
   annual: process.env.STRIPE_PRICE_ANNUAL,
 };
 
-/** Helper: Update user profile in Supabase via service role */
+// ── Helpers ──────────────────────────────────────────────────
+
+/** Read raw body as Buffer (for webhook signature verification) */
+function getRawBody(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    req.on('data', (chunk) => chunks.push(chunk));
+    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('error', reject);
+  });
+}
+
+/**
+ * Parse JSON body manually.
+ * Because bodyParser is disabled (needed for webhook raw body),
+ * we must parse JSON ourselves for non-webhook actions.
+ */
+async function parseJsonBody(req) {
+  // If Vercel already parsed it (shouldn't happen with bodyParser: false, but safe fallback)
+  if (req.body && typeof req.body === 'object' && Object.keys(req.body).length > 0) {
+    return req.body;
+  }
+
+  const raw = await getRawBody(req);
+  const text = raw.toString('utf8');
+
+  if (!text || text.trim().length === 0) {
+    return {};
+  }
+
+  try {
+    return JSON.parse(text);
+  } catch (e) {
+    console.error('Failed to parse request body:', e.message);
+    return {};
+  }
+}
+
+/** Update user profile in Supabase via service role */
 async function updateProfile(userId, updates) {
   const response = await fetch(`${SUPABASE_URL}/rest/v1/profiles?id=eq.${userId}`, {
     method: 'PATCH',
@@ -53,7 +91,7 @@ async function updateProfile(userId, updates) {
   }
 }
 
-/** Helper: Find profile by Stripe customer ID */
+/** Find profile by Stripe customer ID */
 async function findProfileByStripeCustomer(stripeCustomerId) {
   const response = await fetch(
     `${SUPABASE_URL}/rest/v1/profiles?stripe_customer_id=eq.${stripeCustomerId}&select=id,email,tier`,
@@ -70,7 +108,7 @@ async function findProfileByStripeCustomer(stripeCustomerId) {
   return data.length > 0 ? data[0] : null;
 }
 
-/** Helper: Find profile by user ID */
+/** Find profile by user ID */
 async function findProfileById(userId) {
   const response = await fetch(
     `${SUPABASE_URL}/rest/v1/profiles?id=eq.${userId}&select=id,email,tier,stripe_customer_id`,
@@ -87,19 +125,8 @@ async function findProfileById(userId) {
   return data.length > 0 ? data[0] : null;
 }
 
-/** Read raw body for webhook signature verification */
-function getRawBody(req) {
-  return new Promise((resolve, reject) => {
-    const chunks = [];
-    req.on('data', (chunk) => chunks.push(chunk));
-    req.on('end', () => resolve(Buffer.concat(chunks)));
-    req.on('error', reject);
-  });
-}
+// ── Main Handler ─────────────────────────────────────────────
 
-/** ---------------------------
- *  Main Handler
- *  --------------------------- */
 module.exports = async (req, res) => {
   // CORS
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -121,14 +148,28 @@ module.exports = async (req, res) => {
     // CREATE CHECKOUT SESSION
     // ===========================================================
     if (action === 'create-checkout') {
-      const { userId, email, period, promoCode } = req.body || {};
+      const body = await parseJsonBody(req);
+      const { userId, email, period, promoCode } = body;
+
+      console.log('create-checkout received:', { userId: !!userId, email: !!email, period, promoCode: !!promoCode });
 
       if (!userId || !email) {
         return res.status(400).json({ error: 'Missing userId or email' });
       }
 
       if (!period || !PRICES[period]) {
-        return res.status(400).json({ error: 'Invalid period. Use "monthly" or "annual"' });
+        return res.status(400).json({
+          error: 'Invalid period. Use "monthly" or "annual"',
+          received: period,
+          available: Object.keys(PRICES),
+        });
+      }
+
+      const priceId = PRICES[period];
+      if (!priceId) {
+        return res.status(500).json({
+          error: `Stripe price ID not configured for "${period}". Set STRIPE_PRICE_${period.toUpperCase()} in Vercel env vars.`,
+        });
       }
 
       // Check if user already has a Stripe customer
@@ -145,6 +186,7 @@ module.exports = async (req, res) => {
 
         // Save to profile
         await updateProfile(userId, { stripe_customer_id: customerId });
+        console.log(`Created Stripe customer ${customerId} for user ${userId}`);
       }
 
       // Build checkout session config
@@ -154,7 +196,7 @@ module.exports = async (req, res) => {
         payment_method_types: ['card'],
         line_items: [
           {
-            price: PRICES[period],
+            price: priceId,
             quantity: 1,
           },
         ],
@@ -173,25 +215,35 @@ module.exports = async (req, res) => {
         },
       };
 
-      // Add promo code if provided — use EITHER discounts OR allow_promotion_codes, never both
-      if (promoCode) {
+      // Add promo code if provided
+      if (promoCode && promoCode.trim().length > 0) {
         try {
-          const promoCodes = await stripe.promotionCodes.list({ code: promoCode, active: true, limit: 1 });
+          const promoCodes = await stripe.promotionCodes.list({
+            code: promoCode.trim(),
+            active: true,
+            limit: 1,
+          });
           if (promoCodes.data.length > 0) {
+            // Valid promo code found — apply it directly
             sessionConfig.discounts = [{ promotion_code: promoCodes.data[0].id }];
+            console.log(`Applied promo code: ${promoCode}`);
           } else {
+            // Code not found — let user enter manually on Stripe checkout
             sessionConfig.allow_promotion_codes = true;
+            console.log(`Promo code "${promoCode}" not found, allowing manual entry`);
           }
         } catch (promoErr) {
           console.log('Promo code lookup failed, allowing manual entry:', promoErr.message);
           sessionConfig.allow_promotion_codes = true;
         }
       } else {
+        // No code provided — allow manual entry
         sessionConfig.allow_promotion_codes = true;
       }
 
       // Create checkout session
       const session = await stripe.checkout.sessions.create(sessionConfig);
+      console.log(`Checkout session created: ${session.id}`);
 
       return res.status(200).json({ url: session.url, sessionId: session.id });
     }
@@ -200,7 +252,8 @@ module.exports = async (req, res) => {
     // CREATE CUSTOMER PORTAL (manage/cancel subscription)
     // ===========================================================
     if (action === 'create-portal') {
-      const { stripeCustomerId } = req.body || {};
+      const body = await parseJsonBody(req);
+      const { stripeCustomerId } = body;
 
       if (!stripeCustomerId) {
         return res.status(400).json({ error: 'Missing stripeCustomerId' });
@@ -215,7 +268,7 @@ module.exports = async (req, res) => {
     }
 
     // ===========================================================
-    // STRIPE WEBHOOK
+    // STRIPE WEBHOOK (uses raw body — do NOT parse as JSON)
     // ===========================================================
     if (action === 'webhook') {
       const sig = req.headers['stripe-signature'];
@@ -243,7 +296,6 @@ module.exports = async (req, res) => {
         const subscriptionId = session.subscription;
 
         if (userId && subscriptionId) {
-          // Fetch subscription details
           const subscription = await stripe.subscriptions.retrieve(subscriptionId);
           const period = subscription.metadata?.period || 'monthly';
 
@@ -280,7 +332,7 @@ module.exports = async (req, res) => {
         }
       }
 
-      // --- SUBSCRIPTION DELETED (canceled & expired) ---
+      // --- SUBSCRIPTION DELETED ---
       if (event.type === 'customer.subscription.deleted') {
         const subscription = event.data.object;
         const customerId = subscription.customer;
@@ -336,7 +388,8 @@ module.exports = async (req, res) => {
   }
 };
 
-// Disable body parsing for webhook (need raw body for signature verification)
+// Disable Vercel's automatic body parsing so webhook can access raw body
+// for Stripe signature verification. Non-webhook actions parse JSON manually.
 module.exports.config = {
   api: {
     bodyParser: false,
