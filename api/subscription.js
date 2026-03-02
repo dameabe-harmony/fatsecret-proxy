@@ -173,22 +173,21 @@ module.exports = async (req, res) => {
         },
       };
 
-      // Add promo code if provided
+      // Add promo code if provided — use EITHER discounts OR allow_promotion_codes, never both
       if (promoCode) {
-        sessionConfig.allow_promotion_codes = true;
-        // If it's a specific promo code, try to find it
         try {
           const promoCodes = await stripe.promotionCodes.list({ code: promoCode, active: true, limit: 1 });
           if (promoCodes.data.length > 0) {
             sessionConfig.discounts = [{ promotion_code: promoCodes.data[0].id }];
           } else {
-            // Let Stripe handle it — user can enter at checkout
             sessionConfig.allow_promotion_codes = true;
           }
         } catch (promoErr) {
           console.log('Promo code lookup failed, allowing manual entry:', promoErr.message);
           sessionConfig.allow_promotion_codes = true;
         }
+      } else {
+        sessionConfig.allow_promotion_codes = true;
       }
 
       // Create checkout session
