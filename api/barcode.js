@@ -39,8 +39,10 @@ function checkRateLimit(ip) {
     rateBuckets.set(ip, bucket);
   }
   bucket.count += 1;
+
   const remaining = Math.max(0, RATE_LIMIT_MAX_REQUESTS - bucket.count);
   const resetSeconds = Math.ceil((bucket.resetAt - now) / 1000);
+
   return {
     allowed: bucket.count <= RATE_LIMIT_MAX_REQUESTS,
     remaining,
@@ -58,17 +60,8 @@ function cleanupRateBuckets() {
   }
 }
 
-function normalizeBarcode(raw) {
-  const digits = String(raw || "").replace(/\D/g, "");
-  if (digits.length === 13) return digits;
-  if (digits.length === 12) return `0${digits}`;     // UPC-A -> GTIN-13
-  if (digits.length === 8) return digits.padStart(13, "0"); // EAN-8 -> GTIN-13
-  return null;
-}
+/* OAuth helpers */
 
-/** ---------------------------
- *  OAuth helpers
- *  --------------------------- */
 function oauthEncode(str) {
   return encodeURIComponent(String(str)).replace(
     /[!*'()]/g,
@@ -95,12 +88,9 @@ function buildSignature(httpMethod, url, paramString, secret) {
 }
 
 async function callFatSecret(methodName, extraParams = {}) {
+
   const KEY = process.env.FATSECRET_CONSUMER_KEY;
   const SECRET = process.env.FATSECRET_CONSUMER_SECRET;
-
-  if (!KEY || !SECRET) {
-    throw new Error("Missing FATSECRET_CONSUMER_KEY or FATSECRET_CONSUMER_SECRET in Vercel Environment Variables");
-  }
 
   const oauthParams = {
     oauth_consumer_key: KEY,
@@ -122,23 +112,16 @@ async function callFatSecret(methodName, extraParams = {}) {
 
   const finalUrl = `${API_URL}?${paramString}&oauth_signature=${oauthEncode(signature)}`;
 
-  const response = await fetch(finalUrl, { method: "GET" });
+  const response = await fetch(finalUrl);
   const text = await response.text();
 
-  let json;
-  try {
-    json = JSON.parse(text);
-  } catch {
-    throw new Error(`FatSecret returned non-JSON (${response.status}): ${text.slice(0, 300)}`);
-  }
-
-  return json;
+  return JSON.parse(text);
 }
 
-/** ---------------------------
- *  Handler
- *  --------------------------- */
+/* Handler */
+
 module.exports = async (req, res) => {
+
   cleanupRateBuckets();
 
   res.setHeader("Access-Control-Allow-Origin", "*");
@@ -150,123 +133,66 @@ module.exports = async (req, res) => {
     return res.end();
   }
 
-  if (req.method !== "GET") {
-    res.statusCode = 405;
-    res.setHeader("Content-Type", "application/json");
-    return res.end(JSON.stringify({ error: "GET only" }));
-  }
-
-  const ip = getClientIp(req);
-  const rl = checkRateLimit(ip);
-
-  res.setHeader("X-RateLimit-Limit", String(rl.limit));
-  res.setHeader("X-RateLimit-Remaining", String(rl.remaining));
-  res.setHeader("X-RateLimit-Reset", String(rl.resetSeconds));
-
-  if (!rl.allowed) {
-    res.statusCode = 429;
-    res.setHeader("Content-Type", "application/json");
-    return res.end(
-      JSON.stringify({
-        error: "Too many requests",
-        message: `Rate limit exceeded. Try again in ~${rl.resetSeconds}s.`,
-      })
-    );
-  }
-
-  const rawCode = req.query && req.query.code;
-  const code = normalizeBarcode(rawCode);
-  if (!rawCode) {
-    res.statusCode = 400;
-    res.setHeader("Content-Type", "application/json");
-    return res.end(JSON.stringify({ error: "Missing ?code=" }));
-  }
+  const code = req.query && req.query.code;
 
   if (!code) {
     res.statusCode = 400;
-    res.setHeader("Content-Type", "application/json");
-    return res.end(
-      JSON.stringify({
-        error: "Invalid barcode",
-        message: "Provide a UPC-A (12), EAN-13 (13), or EAN-8 (8) barcode",
-      })
-    );
+    return res.end(JSON.stringify({ error: "Missing ?code=" }));
   }
 
   try {
-    res.setHeader(
-      "Cache-Control",
-      `public, s-maxage=${CACHE_S_MAXAGE_SECONDS}, stale-while-revalidate=${CACHE_STALE_WHILE_REVALIDATE_SECONDS}`
-    );
 
     const barcodeResult = await callFatSecret("food.find_id_for_barcode", {
       barcode: code,
-      region: "US",
+      region: "US"
     });
 
-    if (barcodeResult && barcodeResult.error) {
+    const foodId =
+      barcodeResult?.food_id?.value ||
+      barcodeResult?.food_id;
+
+    /* FIX: stop if FatSecret returns 0 */
+
+    if (!foodId || foodId === 0 || foodId === "0") {
+
       res.statusCode = 404;
-      res.setHeader("Content-Type", "application/json");
+
       return res.end(
         JSON.stringify({
           error: "Barcode not found",
           barcode: code,
-          details: barcodeResult.error,
+          details: barcodeResult
         })
       );
+
     }
 
-    const foodId =
-      (barcodeResult && barcodeResult.food_id && barcodeResult.food_id.value) ||
-      (barcodeResult && barcodeResult.food_id);
-
-    if (!foodId) {
-      res.statusCode = 404;
-      res.setHeader("Content-Type", "application/json");
-      return res.end(
-        JSON.stringify({
-          error: "No food_id returned",
-          barcode: code,
-          raw: barcodeResult,
-        })
-      );
-    }
-
-    let foodResult = await callFatSecret("food.get", {
-      food_id: String(foodId),
+    const foodResult = await callFatSecret("food.get", {
+      food_id: String(foodId)
     });
 
-    if (foodResult && foodResult.error) {
-      res.statusCode = 500;
-      res.setHeader("Content-Type", "application/json");
-      return res.end(
-        JSON.stringify({
-          error: "Food fetch failed",
-          details: foodResult.error,
-          food_id: String(foodId),
-        })
-      );
-    }
-
     res.statusCode = 200;
-    res.setHeader("Content-Type", "application/json");
+
     return res.end(
       JSON.stringify({
         success: true,
         barcode: code,
-        food_name: foodResult && foodResult.food && foodResult.food.food_name,
-        data: foodResult,
+        food_name: foodResult?.food?.food_name,
+        data: foodResult
       })
     );
+
   } catch (err) {
-    console.error("Server Error:", err);
+
     res.statusCode = 500;
-    res.setHeader("Content-Type", "application/json");
+
     return res.end(
       JSON.stringify({
         error: "Server error",
-        message: err && err.message ? err.message : String(err),
+        message: err.message
       })
     );
+
   }
+
 };
