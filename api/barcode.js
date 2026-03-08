@@ -1,9 +1,43 @@
 /**
- * /api/barcode?code=XXXXXXXXXXXX
+ * Harmonious Food Finder
+ * FatSecret Barcode Lookup Proxy
  *
- * Env vars (Vercel Project Settings → Environment Variables):
+ * Endpoint:
+ *   /api/barcode?code=XXXXXXXXXXXX
+ *
+ * Purpose:
+ *   Safely query the FatSecret API for nutrition data using a barcode.
+ *   This proxy prevents exposing API credentials to the browser.
+ *
+ * Pipeline:
+ *   1. Receive barcode from HFF scanner
+ *   2. Call FatSecret: food.find_id_for_barcode
+ *   3. If a food_id is returned, call: food.get
+ *   4. Return normalized JSON to the frontend
+ *
+ * Important Fix:
+ *   FatSecret returns food_id = 0 when a barcode has no match.
+ *   The previous version still attempted food.get with ID 0,
+ *   which caused the API error:
+ *
+ *     "Invalid ID: please check your food_id"
+ *
+ *   This version stops the pipeline when food_id === 0
+ *   and returns a proper 404 instead of a 500 error.
+ *
+ * Environment Variables (Vercel Project Settings):
+ *
  *   FATSECRET_CONSUMER_KEY
  *   FATSECRET_CONSUMER_SECRET
+ *
+ * Security / Stability Features:
+ *   • OAuth 1.0 signed requests
+ *   • Per-IP rate limiting (300 requests/min)
+ *   • CDN caching (7 days + stale revalidate)
+ *   • CORS enabled for browser use
+ *
+ * Used By:
+ *   Harmonious Food Finder scanner pipeline
  */
 
 const crypto = require("crypto");
@@ -34,10 +68,12 @@ function getClientIp(req) {
 function checkRateLimit(ip) {
   const now = Date.now();
   let bucket = rateBuckets.get(ip);
+
   if (!bucket || now >= bucket.resetAt) {
     bucket = { count: 0, resetAt: now + RATE_LIMIT_WINDOW_MS };
     rateBuckets.set(ip, bucket);
   }
+
   bucket.count += 1;
 
   const remaining = Math.max(0, RATE_LIMIT_MAX_REQUESTS - bucket.count);
@@ -59,8 +95,6 @@ function cleanupRateBuckets() {
     }
   }
 }
-
-/* OAuth helpers */
 
 function oauthEncode(str) {
   return encodeURIComponent(String(str)).replace(
@@ -118,8 +152,6 @@ async function callFatSecret(methodName, extraParams = {}) {
   return JSON.parse(text);
 }
 
-/* Handler */
-
 module.exports = async (req, res) => {
 
   cleanupRateBuckets();
@@ -150,8 +182,6 @@ module.exports = async (req, res) => {
     const foodId =
       barcodeResult?.food_id?.value ||
       barcodeResult?.food_id;
-
-    /* FIX: stop if FatSecret returns 0 */
 
     if (!foodId || foodId === 0 || foodId === "0") {
 
