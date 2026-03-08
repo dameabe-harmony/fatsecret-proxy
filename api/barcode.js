@@ -58,6 +58,14 @@ function cleanupRateBuckets() {
   }
 }
 
+function normalizeBarcode(raw) {
+  const digits = String(raw || "").replace(/\D/g, "");
+  if (digits.length === 13) return digits;
+  if (digits.length === 12) return `0${digits}`;     // UPC-A -> GTIN-13
+  if (digits.length === 8) return digits.padStart(13, "0"); // EAN-8 -> GTIN-13
+  return null;
+}
+
 /** ---------------------------
  *  OAuth helpers
  *  --------------------------- */
@@ -166,11 +174,23 @@ module.exports = async (req, res) => {
     );
   }
 
-  const code = req.query && req.query.code;
-  if (!code) {
+  const rawCode = req.query && req.query.code;
+  const code = normalizeBarcode(rawCode);
+  if (!rawCode) {
     res.statusCode = 400;
     res.setHeader("Content-Type", "application/json");
     return res.end(JSON.stringify({ error: "Missing ?code=" }));
+  }
+
+  if (!code) {
+    res.statusCode = 400;
+    res.setHeader("Content-Type", "application/json");
+    return res.end(
+      JSON.stringify({
+        error: "Invalid barcode",
+        message: "Provide a UPC-A (12), EAN-13 (13), or EAN-8 (8) barcode",
+      })
+    );
   }
 
   try {
@@ -181,6 +201,7 @@ module.exports = async (req, res) => {
 
     const barcodeResult = await callFatSecret("food.find_id_for_barcode", {
       barcode: code,
+      region: "US",
     });
 
     if (barcodeResult && barcodeResult.error) {
@@ -211,7 +232,7 @@ module.exports = async (req, res) => {
       );
     }
 
-    const foodResult = await callFatSecret("food.get.v4", {
+    let foodResult = await callFatSecret("food.get", {
       food_id: String(foodId),
     });
 
@@ -222,6 +243,7 @@ module.exports = async (req, res) => {
         JSON.stringify({
           error: "Food fetch failed",
           details: foodResult.error,
+          food_id: String(foodId),
         })
       );
     }
