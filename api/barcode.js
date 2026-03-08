@@ -23,7 +23,7 @@
  *     "Invalid ID: please check your food_id"
  *
  *   This version stops the pipeline when food_id === 0
- *   and returns a proper 404 instead of a 500 error.
+ *   and returns a proper 404 error.
  *
  * Environment Variables (Vercel Project Settings):
  *
@@ -169,6 +169,7 @@ module.exports = async (req, res) => {
 
   if (!code) {
     res.statusCode = 400;
+    res.setHeader("Content-Type", "application/json");
     return res.end(JSON.stringify({ error: "Missing ?code=" }));
   }
 
@@ -186,6 +187,7 @@ module.exports = async (req, res) => {
     if (!foodId || foodId === 0 || foodId === "0") {
 
       res.statusCode = 404;
+      res.setHeader("Content-Type", "application/json");
 
       return res.end(
         JSON.stringify({
@@ -202,6 +204,7 @@ module.exports = async (req, res) => {
     });
 
     res.statusCode = 200;
+    res.setHeader("Content-Type", "application/json");
 
     return res.end(
       JSON.stringify({
@@ -215,6 +218,7 @@ module.exports = async (req, res) => {
   } catch (err) {
 
     res.statusCode = 500;
+    res.setHeader("Content-Type", "application/json");
 
     return res.end(
       JSON.stringify({
